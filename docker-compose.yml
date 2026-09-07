@@ -50,6 +50,10 @@ services:
       - MINISTACK_ENDPOINT=http://ministack:4566
       - MINISTACK_CONTAINER_NAME=ministack-aws
       - HEALTH_CHECK_POLL_INTERVAL=5
+      # Limita o tempo de uma tentativa regional antes do failover.
+      - FAILOVER_CONNECT_TIMEOUT=3
+      - FAILOVER_READ_TIMEOUT=15
+      - FAILOVER_ATTEMPTS_PER_REGION=2
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock"
     depends_on:

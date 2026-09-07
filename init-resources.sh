@@ -32,6 +32,7 @@ $AWS_CLI lambda create-function \
   --runtime java17 \
   --handler dynamodb_streams.DynamoDBStreamHandler::handleRequest \
   --memory-size 256 \
+  --timeout 30 \
   --zip-file fileb:///etc/localstack/init/ready.d/target/product-lambda.jar \
   --role arn:aws:iam::000000000000:role/productRole \
   --environment 'Variables={AWS_REGION=us-east-1,AWS_ENDPOINT_HOST=ministack,AWS_DYNAMODB_ENDPOINT=http://chaos-bridge:4567/dynamodb}' \
@@ -49,6 +50,7 @@ $AWS_CLI lambda create-function \
   --runtime java17 \
   --handler lambda.AddProduct::handleRequest \
   --memory-size 512 \
+  --timeout 30 \
   --zip-file fileb:///etc/localstack/init/ready.d/target/product-lambda.jar \
   --region us-east-1 \
   --role arn:aws:iam::000000000000:role/productRole \
@@ -60,6 +62,7 @@ $AWS_CLI lambda create-function \
   --runtime java17 \
   --handler lambda.GetProduct::handleRequest \
   --memory-size 512 \
+  --timeout 30 \
   --zip-file fileb:///etc/localstack/init/ready.d/target/product-lambda.jar \
   --region us-east-1 \
   --role arn:aws:iam::000000000000:role/productRole \
@@ -71,6 +74,7 @@ $AWS_CLI lambda create-function \
   --runtime python3.11 \
   --handler healthcheck.lambda_handler \
   --memory-size 512 \
+  --timeout 30 \
   --zip-file fileb:///etc/localstack/init/ready.d/healthcheck.zip \
   --region us-east-1 \
   --role arn:aws:iam::000000000000:role/productRole
@@ -127,6 +131,7 @@ $AWS_CLI lambda create-function \
   --runtime java17 \
   --handler lambda.AddProduct::handleRequest \
   --memory-size 512 \
+  --timeout 30 \
   --zip-file fileb:///etc/localstack/init/ready.d/target/product-lambda.jar \
   --region us-west-1 \
   --role arn:aws:iam::000000000000:role/productRole \
@@ -138,6 +143,7 @@ $AWS_CLI lambda create-function \
   --runtime java17 \
   --handler lambda.GetProduct::handleRequest \
   --memory-size 512 \
+  --timeout 30 \
   --zip-file fileb:///etc/localstack/init/ready.d/target/product-lambda.jar \
   --region us-west-1 \
   --role arn:aws:iam::000000000000:role/productRole \
@@ -149,6 +155,7 @@ $AWS_CLI lambda create-function \
   --runtime python3.11 \
   --handler healthcheck.lambda_handler \
   --memory-size 512 \
+  --timeout 30 \
   --zip-file fileb:///etc/localstack/init/ready.d/healthcheck.zip \
   --region us-west-1 \
   --role arn:aws:iam::000000000000:role/productRole

@@ -27,6 +27,7 @@ Serviços suportados como injetores de falha:
     - "apigateway"  → registra a falha no estado interno + atualiza health check
     - "lambda"      → registra a falha no estado interno + atualiza health check
     - apigateway+lambda combinados → emula falha multi-serviço na região primária
+    - endpoint lógico de failover → encaminha productApi para a primeira região saudável
 
 Limitação conhecida do MiniStack:
     O MiniStack não executa health checks de Route53 automaticamente
@@ -34,6 +35,7 @@ Limitação conhecida do MiniStack:
     DNS, o chaos-bridge força o status via /_ministack/route53/health-checks/{id}/status.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -41,13 +43,15 @@ import re
 import threading
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import boto3
 import docker
 import requests
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 # ---------------------------------------------------------------------------
 # Configuração
@@ -62,6 +66,10 @@ log = logging.getLogger("chaos-bridge")
 MINISTACK_ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://ministack:4566")
 MINISTACK_CONTAINER_NAME = os.environ.get("MINISTACK_CONTAINER_NAME", "ministack-aws")
 HEALTH_CHECK_POLL_INTERVAL = int(os.environ.get("HEALTH_CHECK_POLL_INTERVAL", "5"))
+FAILOVER_CONNECT_TIMEOUT = float(os.environ.get("FAILOVER_CONNECT_TIMEOUT", "3"))
+FAILOVER_READ_TIMEOUT = float(os.environ.get("FAILOVER_READ_TIMEOUT", "15"))
+FAILOVER_ATTEMPTS_PER_REGION = int(os.environ.get("FAILOVER_ATTEMPTS_PER_REGION", "2"))
+RETRYABLE_UPSTREAM_STATUS_CODES = {502, 503, 504}
 
 # ---------------------------------------------------------------------------
 # Estado em memória — faults ativos
@@ -334,8 +342,247 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+app.mount(
+    "/console/icons",
+    StaticFiles(directory=Path(__file__).parent / "console" / "icons"),
+    name="console-icons",
+)
 app.add_api_route("/dynamodb", dynamodb_proxy, methods=["POST"])
 app.add_api_route("/dynamodb/{path:path}", dynamodb_proxy, methods=["POST"])
+
+
+@app.get("/console", include_in_schema=False)
+async def console() -> FileResponse:
+    """Console web local para operar o laboratório sem usar a CLI."""
+    return FileResponse(Path(__file__).parent / "console" / "index.html")
+
+
+def _console_client(service: str, region: str = "us-east-1"):
+    return boto3.client(service, **_boto_kwargs(region))
+
+
+FAILOVER_REGIONS = ("us-east-1", "us-west-1")
+
+
+def _region_has_gateway_fault(region: str) -> bool:
+    """Indica se a região deve ser ignorada pelo endpoint lógico de failover."""
+    with _faults_lock:
+        return any(
+            fault.get("service") in ("apigateway", "lambda")
+            and (not fault.get("region") or fault.get("region") == region)
+            for fault in _active_faults
+        )
+
+
+def _api_id_for_region(region: str) -> str | None:
+    """Obtém o ID interno da productApi usando a tag estável da região."""
+    apis = _console_client("apigateway", region).get_rest_apis().get("items", [])
+    for api in apis:
+        if api.get("tags", {}).get("_custom_id_") in {"12345", "67890"}:
+            return api.get("id")
+    return None
+
+
+def _ordered_failover_regions(preferred_region: str | None) -> list[str]:
+    """Coloca a região preferida na frente sem permitir regiões arbitrárias."""
+    if preferred_region in FAILOVER_REGIONS:
+        return [preferred_region, *[r for r in FAILOVER_REGIONS if r != preferred_region]]
+    return list(FAILOVER_REGIONS)
+
+
+def _product_api_url(region: str, api_id: str) -> str:
+    return f"{MINISTACK_ENDPOINT}/restapis/{api_id}/dev/_user_request_/productApi"
+
+
+async def _invoke_product_api(
+    body: dict[str, Any],
+    *,
+    method: str,
+    preferred_region: str | None = None,
+) -> Response:
+    """Encaminha productApi para a primeira região sem fault de API Gateway/Lambda."""
+    if method not in {"GET", "POST"}:
+        raise HTTPException(status_code=405, detail="Apenas GET e POST são suportados.")
+
+    query = body.get("query", {})
+    payload = body.get("payload")
+    regions = _ordered_failover_regions(preferred_region)
+    skipped_regions: list[str] = []
+
+    for region in regions:
+        if _region_has_gateway_fault(region):
+            skipped_regions.append(region)
+            continue
+
+        try:
+            api_id = await asyncio.to_thread(_api_id_for_region, region)
+        except Exception as exc:
+            log.warning("Não foi possível descobrir a API da região %s: %s", region, exc)
+            skipped_regions.append(region)
+            continue
+
+        if not api_id:
+            log.warning("Nenhuma productApi encontrada na região %s.", region)
+            skipped_regions.append(region)
+            continue
+
+        upstream = None
+        last_region_failure = None
+        for attempt in range(1, FAILOVER_ATTEMPTS_PER_REGION + 1):
+            try:
+                upstream = await asyncio.to_thread(
+                    requests.request,
+                    method=method,
+                    url=_product_api_url(region, api_id),
+                    params=query if method == "GET" else None,
+                    data=json.dumps(payload) if method == "POST" else None,
+                    headers={"Content-Type": "application/json"} if method == "POST" else None,
+                    timeout=(FAILOVER_CONNECT_TIMEOUT, FAILOVER_READ_TIMEOUT),
+                )
+            except requests.RequestException as exc:
+                last_region_failure = f"{region} ({type(exc).__name__}, tentativa {attempt})"
+                log.warning(
+                    "Falha ao encaminhar productApi para %s (tentativa %s/%s): %s",
+                    region,
+                    attempt,
+                    FAILOVER_ATTEMPTS_PER_REGION,
+                    exc,
+                )
+                continue
+
+            if upstream.status_code in RETRYABLE_UPSTREAM_STATUS_CODES:
+                last_region_failure = f"{region} (HTTP {upstream.status_code}, tentativa {attempt})"
+                log.warning(
+                    "Região %s retornou %s ao executar productApi "
+                    "(tentativa %s/%s).",
+                    region,
+                    upstream.status_code,
+                    attempt,
+                    FAILOVER_ATTEMPTS_PER_REGION,
+                )
+                continue
+            break
+
+        if upstream is None or upstream.status_code in RETRYABLE_UPSTREAM_STATUS_CODES:
+            skipped_regions.append(last_region_failure or region)
+            continue
+
+        response_headers = {
+            "content-type": upstream.headers.get("content-type", "application/json"),
+            "x-failover-region": region,
+            "x-failover-api-id": api_id,
+        }
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            headers=response_headers,
+        )
+
+    return JSONResponse(
+        status_code=503,
+        content={
+            "message": "Nenhuma região saudável disponível para productApi.",
+            "attempted_regions": regions,
+            "skipped_regions": skipped_regions,
+        },
+    )
+
+
+@app.get("/console/api/resources")
+async def console_resources() -> dict[str, Any]:
+    """Retorna um resumo dos recursos provisionados para a console."""
+    result: dict[str, Any] = {"regions": {}, "route53": {}, "faults": []}
+    for region in ("us-east-1", "us-west-1"):
+        apis = _console_client("apigateway", region).get_rest_apis().get("items", [])
+        tables = _console_client("dynamodb", region).list_tables().get("TableNames", [])
+        functions = _console_client("lambda", region).list_functions().get("Functions", [])
+        result["regions"][region] = {
+            "apis": [
+                {"id": api["id"], "name": api.get("name"), "tags": api.get("tags", {})}
+                for api in apis
+            ],
+            "tables": tables,
+            "functions": [fn["FunctionName"] for fn in functions],
+        }
+
+    route53 = _console_client("route53")
+    result["route53"] = {
+        "hosted_zones": route53.list_hosted_zones().get("HostedZones", []),
+        "health_checks": route53.list_health_checks().get("HealthChecks", []),
+    }
+    with _faults_lock:
+        result["faults"] = list(_active_faults)
+    return result
+
+
+@app.post("/console/api/invoke")
+async def console_invoke(request: Request) -> Response:
+    """Invoca a rota productApi usando o ID interno da API selecionada."""
+    body = await request.json()
+    region = body.get("region", "us-east-1")
+    api_id = body.get("api_id")
+    method = body.get("method", "GET").upper()
+    query = body.get("query", {})
+    payload = body.get("payload")
+    if not api_id:
+        raise HTTPException(status_code=400, detail="api_id é obrigatório.")
+    if method not in {"GET", "POST"}:
+        raise HTTPException(status_code=400, detail="Apenas GET e POST são suportados.")
+
+    path = f"{MINISTACK_ENDPOINT}/restapis/{api_id}/dev/_user_request_/productApi"
+    try:
+        upstream = await asyncio.to_thread(
+            requests.request,
+            method=method,
+            url=path,
+            params=query if method == "GET" else None,
+            data=json.dumps(payload) if method == "POST" else None,
+            headers={"Content-Type": "application/json"} if method == "POST" else None,
+            timeout=(FAILOVER_CONNECT_TIMEOUT, FAILOVER_READ_TIMEOUT),
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers={"content-type": upstream.headers.get("content-type", "application/json")},
+    )
+
+
+@app.api_route("/failover/product", methods=["GET", "POST"])
+async def failover_product(request: Request) -> Response:
+    """
+    Endpoint lógico de failover para productApi.
+
+    O corpo opcional pode conter ``query``, ``payload`` e ``preferred_region``.
+    A região preferida é tentada primeiro; faults de API Gateway/Lambda fazem
+    a região ser ignorada e o tráfego seguir para a próxima.
+    """
+    raw_body = await request.body()
+    if raw_body:
+        try:
+            body = json.loads(raw_body)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Body deve ser um JSON válido.") from exc
+    else:
+        body = {
+            "preferred_region": request.query_params.get("preferred_region"),
+            "query": {
+                key: value
+                for key, value in request.query_params.items()
+                if key != "preferred_region"
+            },
+        }
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body deve ser um objeto JSON.")
+
+    return await _invoke_product_api(
+        body,
+        method=request.method.upper(),
+        preferred_region=body.get("preferred_region"),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -23,6 +23,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copia o código da aplicação
 COPY app.py .
+COPY console ./console
 
 # Expõe a porta do chaos-bridge (4567 para não colidir com a 4566 do MiniStack)
 EXPOSE 4567

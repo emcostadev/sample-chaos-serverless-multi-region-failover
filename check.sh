@@ -8,14 +8,28 @@ AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL:-"http://localhost:4566"}
 CHAOS_ENDPOINT=${CHAOS_ENDPOINT:-"http://localhost:4567"}
 AWS_CLI="aws --endpoint-url $AWS_ENDPOINT_URL"
 
-PRIMARY_API_ID="12345"
-SECONDARY_API_ID="67890"
+PRIMARY_API_TAG="12345"
+SECONDARY_API_TAG="67890"
 PRIMARY_API_REGION="us-east-1"
 HEALTH_CHECK_RESOURCE_REGION="us-west-1"
 HOSTED_ZONE_NAME="hello-ministack.local"
 FAILOVER_RECORD_NAME="test.${HOSTED_ZONE_NAME}"
 
 # API Gateway path-style (MiniStack)
+PRIMARY_API_ID=$($AWS_CLI apigateway get-rest-apis --region "$PRIMARY_API_REGION" \
+    --query "items[?tags._custom_id_=='${PRIMARY_API_TAG}'].id | [0]" --output text)
+SECONDARY_API_ID=$($AWS_CLI apigateway get-rest-apis --region us-west-1 \
+    --query "items[?tags._custom_id_=='${SECONDARY_API_TAG}'].id | [0]" --output text)
+
+if [[ -z "$PRIMARY_API_ID" || "$PRIMARY_API_ID" == "None" ]]; then
+    echo "API primária não encontrada pela tag ${PRIMARY_API_TAG}." >&2
+    exit 1
+fi
+if [[ -z "$SECONDARY_API_ID" || "$SECONDARY_API_ID" == "None" ]]; then
+    echo "API secundária não encontrada pela tag ${SECONDARY_API_TAG}." >&2
+    exit 1
+fi
+
 PRIMARY_API_URL="http://localhost:4566/restapis/${PRIMARY_API_ID}/dev/_user_request_"
 
 echo "--- Step 1: Verifica recursos implantados ---"
@@ -47,7 +61,7 @@ echo
 
 echo "--- Step 4: Obtém ID do health check ---"
 HEALTH_CHECK_ID=$($AWS_CLI route53 list-health-checks \
-    --query "HealthChecks[?HealthCheckConfig.FullyQualifiedDomainName=='${PRIMARY_API_ID}.execute-api.ministack.local'].Id" \
+    --query "HealthChecks[?HealthCheckConfig.FullyQualifiedDomainName=='${PRIMARY_API_TAG}.execute-api.ministack.local'].Id" \
     --output text --region "$HEALTH_CHECK_RESOURCE_REGION")
 echo "Health Check ID: $HEALTH_CHECK_ID"
 export HEALTH_CHECK_ID
@@ -67,11 +81,13 @@ echo "Aguardando detecção de falha pelo Route53 (~35 segundos)..."
 sleep 35
 
 echo "--- Step 6: Verifica DNS de failover após injeção ---"
-echo "Record sets após falha (deve indicar SECONDARY como ativo):"
+echo "Record sets permanecem como definição do failover (o MiniStack não troca o registro ativo):"
 $AWS_CLI route53 list-resource-record-sets \
     --hosted-zone-id "$HOSTED_ZONE_ID" \
     --query "ResourceRecordSets[?Name=='${FAILOVER_RECORD_NAME}.']" \
     --output json
+echo "Faults ativos no chaos-bridge:"
+curl -s "${CHAOS_ENDPOINT}/_chaos/faults" | python3 -m json.tool
 echo
 
 echo "--- Step 7: Status do health check ---"
@@ -91,11 +107,13 @@ echo "Aguardando recuperação (~35 segundos)..."
 sleep 35
 
 echo "--- Step 9: Verifica failback para a região primária ---"
-echo "Record sets após recuperação (deve indicar PRIMARY como ativo):"
+echo "Record sets continuam iguais; o failback simulado é confirmado pela ausência de faults:"
 $AWS_CLI route53 list-resource-record-sets \
     --hosted-zone-id "$HOSTED_ZONE_ID" \
     --query "ResourceRecordSets[?Name=='${FAILOVER_RECORD_NAME}.']" \
     --output json
+echo "Faults ativos no chaos-bridge:"
+curl -s "${CHAOS_ENDPOINT}/_chaos/faults" | python3 -m json.tool
 echo
 
 echo "Script de verificação finalizado."

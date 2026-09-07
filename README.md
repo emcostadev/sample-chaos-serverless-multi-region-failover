@@ -33,6 +33,7 @@ As principais diferenças são:
 - O healthcheck do MiniStack usa Python em vez de `curl`, que não está disponível nessa imagem.
 - O `chaos-bridge` fornece o proxy `http://localhost:4567/dynamodb`. Durante um fault, somente as chamadas DynamoDB recebem `503`; o MiniStack permanece ativo.
 - As Lambdas Java usam `AWS_DYNAMODB_ENDPOINT` para acessar o proxy, enquanto os demais serviços continuam no MiniStack.
+- O endpoint lógico `http://localhost:4567/failover/product` simula o roteamento de failover: tenta a região preferida e ignora regiões com fault de API Gateway ou Lambda.
 - O failover Route53 é validado pela API e pelo estado do `chaos-bridge`, pois o MiniStack não fornece DNS real nem status nativo de health checks.
 - Os testes descobrem o ID interno real da API Gateway pela tag `_custom_id_`, em vez de assumir que `12345` e `67890` sejam IDs de execução.
 
@@ -90,6 +91,7 @@ O fluxo foi validado localmente com os quatro testes de integração passando.
 - `GET /_chaos/faults`    — lista faults ativos
 - `DELETE /_chaos/faults` — remove faults
 - `POST /dynamodb`        — proxy interno usado pelas Lambdas Java
+- `GET|POST /failover/product` — encaminha `productApi` para a primeira região saudável
 - `dynamodb` fault → retorna indisponibilidade somente para chamadas DynamoDB
 - `apigateway`/`lambda` fault → força status Unhealthy nos health checks do Route53
 
@@ -192,17 +194,86 @@ make deploy
 
 ## Testando manualmente
 
+### Console web local
+
+Depois de executar `make start`, abra:
+
+```text
+http://localhost:4567/console
+```
+
+![Console web do laboratório](images/console.jpg)
+
+A console é servida pelo `chaos-bridge` e não exige Node.js, npm ou outro
+frontend. Ela permite visualizar os recursos provisionados, executar chamadas
+no `productApi` com failover automático e ativar ou desativar faults de
+DynamoDB, API Gateway e Lambda por região.
+
+#### Como utilizar a console
+
+1. Inicie o ambiente e aguarde o provisionamento:
+
+   ```bash
+   make start
+   make ready
+   make deploy
+   ```
+
+2. Acesse [http://localhost:4567/console](http://localhost:4567/console).
+
+3. No painel **Recursos provisionados**, confira as APIs, Lambdas, tabelas e
+   regiões disponíveis. Os IDs exibidos são os IDs internos descobertos no
+   MiniStack.
+
+4. No painel **API Gateway**, escolha `GET` ou `POST`:
+   - `GET` usa o campo de consulta `id`;
+   - `POST` usa os campos JSON do produto;
+   - a região preferida é tentada primeiro;
+   - se houver fault ou erro transitório, o endpoint tenta a outra região;
+   - a resposta informa a região que atendeu a chamada.
+
+5. No painel **Chaos Engineering**, selecione uma região e clique no ícone do
+   serviço para alternar o fault:
+   - verde: serviço disponível;
+   - vermelho: fault ativo;
+   - DynamoDB afeta somente as operações do DynamoDB naquela região;
+   - API Gateway e Lambda tornam a região inelegível para o failover lógico.
+
+6. Execute novamente a operação no painel **API Gateway** e observe o resultado
+   e a região atendente. Os faults ativos e o resultado da ativação aparecem no
+   painel **Chaos Engineering**.
+
+Para acompanhar o mesmo estado pelo terminal:
+
+```bash
+# Faults ativos
+curl http://localhost:4567/_chaos/faults
+
+# Estado do ambiente
+curl http://localhost:4567/_chaos_bridge/health
+
+# Chamada GET com failover lógico
+curl 'http://localhost:4567/failover/product?preferred_region=us-east-1&id=prod-1'
+```
+
 ### Operação normal
 
 ```bash
+# Descobrir o ID interno real da API primária.
+# 12345 é apenas a tag _custom_id_, não o ID usado na URL.
+PRIMARY_API_ID=$(aws --endpoint-url http://localhost:4566 apigateway get-rest-apis \
+  --region us-east-1 \
+  --query "items[?tags._custom_id_=='12345'].id | [0]" \
+  --output text)
+
 # Criar produto
-curl -X POST 'http://localhost:4566/restapis/12345/dev/_user_request_/productApi' \
+curl -X POST "http://localhost:4566/restapis/${PRIMARY_API_ID}/dev/_user_request_/productApi" \
   -H 'Content-Type: application/json' \
   -d '{"id": "prod-1", "name": "Produto Teste", "price": "29.99", "description": "Teste"}'
 # Resposta esperada: Product added/updated successfully.
 
 # Buscar produto
-curl 'http://localhost:4566/restapis/12345/dev/_user_request_/productApi?id=prod-1'
+curl "http://localhost:4566/restapis/${PRIMARY_API_ID}/dev/_user_request_/productApi?id=prod-1"
 ```
 
 ### Cenário 1 — DynamoDB Outage
@@ -212,7 +283,7 @@ curl 'http://localhost:4566/restapis/12345/dev/_user_request_/productApi?id=prod
 make chaos-inject SERVICE=dynamodb REGION=us-east-1
 
 # 2. Tentar criar produto durante a falha
-curl -X POST 'http://localhost:4566/restapis/12345/dev/_user_request_/productApi' \
+curl -X POST "http://localhost:4566/restapis/${PRIMARY_API_ID}/dev/_user_request_/productApi" \
   -H 'Content-Type: application/json' \
   -d '{"id": "prod-outage", "name": "Produto Outage", "price": "0.00", "description": "Durante falha"}'
 # Resposta esperada: A DynamoDB error occurred. Message sent to queue.
@@ -228,8 +299,11 @@ aws --endpoint-url http://localhost:4566 dynamodb scan --table-name Products --r
 
 ```bash
 # 1. Verificar estado inicial do failover
+HOSTED_ZONE_ID=$(aws --endpoint-url http://localhost:4566 route53 list-hosted-zones \
+  --query "HostedZones[?Name=='hello-ministack.local.'].Id | [0]" \
+  --output text | sed 's|/hostedzone/||')
 aws --endpoint-url http://localhost:4566 route53 list-resource-record-sets \
-  --hosted-zone-id <HOSTED_ZONE_ID>
+  --hosted-zone-id "$HOSTED_ZONE_ID"
 
 # 2. Injetar falhas na região primária
 curl -X POST http://localhost:4567/_chaos/faults \
@@ -238,15 +312,50 @@ curl -X POST http://localhost:4567/_chaos/faults \
 
 # 3. Aguardar e verificar failover para us-west-1
 sleep 35
+# O MiniStack mantém os dois record sets como configuração. A troca do
+# registro ativo não é executada nativamente; confirme o fault simulado:
+curl http://localhost:4567/_chaos/faults
 aws --endpoint-url http://localhost:4566 route53 list-resource-record-sets \
-  --hosted-zone-id <HOSTED_ZONE_ID>
+  --hosted-zone-id "$HOSTED_ZONE_ID"
 
 # 4. Remover falhas e verificar failback
 make chaos-clear
 sleep 35
+# A ausência de faults confirma o failback simulado:
+curl http://localhost:4567/_chaos/faults
 aws --endpoint-url http://localhost:4566 route53 list-resource-record-sets \
-  --hosted-zone-id <HOSTED_ZONE_ID>
+  --hosted-zone-id "$HOSTED_ZONE_ID"
 ```
+
+### Endpoint lógico de failover
+
+Como o MiniStack não fornece DNS real, o `chaos-bridge` também expõe um
+endpoint lógico para testar o redirecionamento entre regiões:
+
+```bash
+# A região preferida é tentada primeiro.
+curl -X POST http://localhost:4567/failover/product \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "preferred_region": "us-east-1",
+    "payload": {
+      "id": "prod-failover",
+      "name": "Produto Failover",
+      "price": "39.99",
+      "description": "Criado pelo endpoint lógico"
+    }
+  }'
+
+# Para GET, os parâmetros podem ser enviados diretamente na query string.
+curl 'http://localhost:4567/failover/product?preferred_region=us-east-1&id=prod-failover'
+```
+
+Quando a região preferida tiver fault de `apigateway` ou `lambda`, ela será
+ignorada e a chamada seguirá para a próxima região. A resposta inclui os
+headers `X-Failover-Region` e `X-Failover-Api-Id`. Se as duas regiões estiverem
+indisponíveis, o endpoint retorna `503`. Cada região recebe até duas tentativas,
+com timeout de conexão de 3 segundos e leitura de 15 segundos, para tolerar
+falhas transitórias de cold start sem bloquear indefinidamente o failover.
 
 ---
 
