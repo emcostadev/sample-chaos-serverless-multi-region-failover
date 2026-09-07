@@ -10,6 +10,8 @@
 
 ---
 
+![Console web do laboratório](images/console.jpg)
+
 ## O que é este laboratório
 
 Este laboratório demonstra **chaos engineering em uma aplicação serverless multi-região** usando exclusivamente ferramentas gratuitas e open-source.
@@ -159,8 +161,8 @@ Não é necessário nenhuma conta em nuvem, chave de API ou licença de software
 ## Instalação
 
 ```bash
-git clone <seu-repositório>
-cd chaos-serverless-multi-region-failover
+git clone git@github.com:emcostadev/sample-chaos-serverless-multi-region-failover.git
+cd samples-chaos-serverless-multi-region-failover
 
 # Verifica pré-requisitos
 make check
@@ -201,9 +203,6 @@ Depois de executar `make start`, abra:
 ```text
 http://localhost:4567/console
 ```
-
-![Console web do laboratório](images/console.jpg)
-
 A console é servida pelo `chaos-bridge` e não exige Node.js, npm ou outro
 frontend. Ela permite visualizar os recursos provisionados, executar chamadas
 no `productApi` com failover automático e ativar ou desativar faults de
