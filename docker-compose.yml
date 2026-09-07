@@ -1,0 +1,67 @@
+services:
+
+  ministack:
+    container_name: ministack-aws
+    image: ministackorg/ministack:latest
+    networks:
+      - lab_network
+    ports:
+      - "127.0.0.1:4566:4566"
+      - "127.0.0.1:4510-4559:4510-4559"
+    environment:
+      # Variável lida pelas Lambdas Java (ProductApi.java / DynamoDBStreamHandler.java)
+      # para construir o endpoint do AWS SDK dentro do container.
+      - AWS_ENDPOINT_HOST=ministack
+      # URL canônica para scripts e init hooks
+      - AWS_ENDPOINT_URL=http://ministack:4566
+      # Nível de log
+      - LOG_LEVEL=INFO
+      # Executor de Lambda: "docker" para lambdas Java (requer Docker socket)
+      - LAMBDA_EXECUTOR=docker
+      # Rede Docker compartilhada entre MiniStack e containers de Lambda
+      - DOCKER_NETWORK=lab_network
+      # Conta padrão compatível com ARNs hardcoded no projeto
+      - DEFAULT_ACCOUNT_ID=000000000000
+    volumes:
+      - "./volume:/var/lib/ministack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      # Init hooks: a imagem escaneia /etc/localstack/init/ready.d/
+      - "./lambda-functions/target/product-lambda.jar:/etc/localstack/init/ready.d/target/product-lambda.jar"
+      - "./lambda-functions/lambda-python/healthcheck.zip:/etc/localstack/init/ready.d/healthcheck.zip"
+      - "./init-resources.sh:/etc/localstack/init/ready.d/init-resources.sh"
+    healthcheck:
+      # A imagem MiniStack já inclui Python, mas não inclui curl.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4566/_ministack/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  chaos-bridge:
+    container_name: chaos-bridge
+    build:
+      context: ./chaos-bridge
+      dockerfile: Dockerfile
+    networks:
+      - lab_network
+    ports:
+      - "127.0.0.1:4567:4567"
+    environment:
+      - MINISTACK_ENDPOINT=http://ministack:4566
+      - MINISTACK_CONTAINER_NAME=ministack-aws
+      - HEALTH_CHECK_POLL_INTERVAL=5
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    depends_on:
+      ministack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4567/_chaos_bridge/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+networks:
+  lab_network:
+    name: lab_network

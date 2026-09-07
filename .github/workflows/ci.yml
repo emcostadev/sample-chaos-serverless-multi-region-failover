@@ -1,0 +1,77 @@
+name: Deploy using AWS CLI
+
+on:
+  push:
+    paths-ignore:
+      - 'README.md'
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  integration-tests:
+    name: Run Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install dependencies
+        run: make install
+
+      - name: Start MiniStack and chaos-bridge
+        run: |
+          make start
+          make ready
+
+      - name: Deploy chaos engineering solutions
+        run: make deploy
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_ENDPOINT_URL: http://localhost:4566
+
+      - name: Run Integration Tests
+        run: make test
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_ENDPOINT_URL: http://localhost:4566
+          CHAOS_ENDPOINT: http://localhost:4567
+
+      - name: Collect logs on failure
+        if: failure()
+        run: make logs
+
+      - name: Upload logs artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-logs.txt
+          path: ./logs.txt
+
+      - name: Collect MiniStack diagnostics on failure
+        if: failure()
+        run: |
+          curl -s http://localhost:4566/_ministack/health > ministack-health.json || true
+          curl -s http://localhost:4567/_chaos_bridge/health > chaos-bridge-health.json || true
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics
+          path: |
+            ministack-health.json
+            chaos-bridge-health.json
