@@ -21,7 +21,9 @@ log "Criando hosted zone..."
 HOSTED_ZONE_NAME="hello-ministack.local"
 RAW_HOSTED_ZONE_ID=$($AWS_CLI route53 create-hosted-zone \
     --name "$HOSTED_ZONE_NAME" \
-    --caller-reference "zone-$(date +%s)" | jq -r .HostedZone.Id)
+    --caller-reference "zone-$(date +%s)" \
+    --query 'HostedZone.Id' \
+    --output text)
 CLEANED_HOSTED_ZONE_ID="${RAW_HOSTED_ZONE_ID#/hostedzone/}"
 
 log "Hosted Zone: $HOSTED_ZONE_NAME  ID: $RAW_HOSTED_ZONE_ID"
@@ -46,7 +48,9 @@ HEALTH_CHECK_RESOURCE_REGION="us-west-1"
 HEALTH_CHECK_ID=$($AWS_CLI route53 create-health-check \
     --caller-reference "hc-app-${PRIMARY_API_ID}-$(date +%s)" \
     --region "$HEALTH_CHECK_RESOURCE_REGION" \
-    --health-check-config "{\"FullyQualifiedDomainName\": \"${PRIMARY_API_GATEWAY_FQDN}\", \"Port\": ${HEALTH_CHECK_PORT}, \"ResourcePath\": \"${HEALTH_CHECK_RESOURCE_PATH}\", \"Type\": \"HTTP\", \"RequestInterval\": 10, \"FailureThreshold\": 2}" | jq -r .HealthCheck.Id)
+    --health-check-config "{\"FullyQualifiedDomainName\": \"${PRIMARY_API_GATEWAY_FQDN}\", \"Port\": ${HEALTH_CHECK_PORT}, \"ResourcePath\": \"${HEALTH_CHECK_RESOURCE_PATH}\", \"Type\": \"HTTP\", \"RequestInterval\": 10, \"FailureThreshold\": 2}" \
+    --query 'HealthCheck.Id' \
+    --output text)
 
 log "Health check criado: $HEALTH_CHECK_ID (região: $HEALTH_CHECK_RESOURCE_REGION)"
 export HEALTH_CHECK_ID

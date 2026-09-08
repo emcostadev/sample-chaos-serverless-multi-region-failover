@@ -20,6 +20,8 @@ services:
       - LAMBDA_EXECUTOR=docker
       # Rede Docker compartilhada entre MiniStack e containers de Lambda
       - DOCKER_NETWORK=lab_network
+      # Dá tempo para o Docker iniciar o runtime Java sem abortar o cold start.
+      - MINISTACK_DOCKER_TIMEOUT=30
       # Conta padrão compatível com ARNs hardcoded no projeto
       - DEFAULT_ACCOUNT_ID=000000000000
     volumes:
@@ -52,8 +54,8 @@ services:
       - HEALTH_CHECK_POLL_INTERVAL=5
       # Limita o tempo de uma tentativa regional antes do failover.
       - FAILOVER_CONNECT_TIMEOUT=3
-      - FAILOVER_READ_TIMEOUT=15
-      - FAILOVER_ATTEMPTS_PER_REGION=2
+      - FAILOVER_READ_TIMEOUT=8
+      - FAILOVER_ATTEMPTS_PER_REGION=1
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock"
     depends_on:

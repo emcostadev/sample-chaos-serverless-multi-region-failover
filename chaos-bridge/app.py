@@ -67,8 +67,9 @@ MINISTACK_ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://ministack:4566
 MINISTACK_CONTAINER_NAME = os.environ.get("MINISTACK_CONTAINER_NAME", "ministack-aws")
 HEALTH_CHECK_POLL_INTERVAL = int(os.environ.get("HEALTH_CHECK_POLL_INTERVAL", "5"))
 FAILOVER_CONNECT_TIMEOUT = float(os.environ.get("FAILOVER_CONNECT_TIMEOUT", "3"))
-FAILOVER_READ_TIMEOUT = float(os.environ.get("FAILOVER_READ_TIMEOUT", "15"))
-FAILOVER_ATTEMPTS_PER_REGION = int(os.environ.get("FAILOVER_ATTEMPTS_PER_REGION", "2"))
+FAILOVER_READ_TIMEOUT = float(os.environ.get("FAILOVER_READ_TIMEOUT", "8"))
+FAILOVER_ATTEMPTS_PER_REGION = int(os.environ.get("FAILOVER_ATTEMPTS_PER_REGION", "1"))
+WARMUP_TIMEOUT = float(os.environ.get("WARMUP_TIMEOUT", "120"))
 RETRYABLE_UPSTREAM_STATUS_CODES = {502, 503, 504}
 
 # ---------------------------------------------------------------------------
@@ -80,6 +81,7 @@ _active_faults: list[dict] = []       # [{"service": "dynamodb", "region": "us-e
 _paused_containers: set[str] = set()  # containers atualmente pausados por este bridge
 _health_check_thread: threading.Thread | None = None
 _health_check_stop = threading.Event()
+_warmup_task: asyncio.Task | None = None
 
 # ---------------------------------------------------------------------------
 # Docker client
@@ -155,13 +157,14 @@ async def dynamodb_proxy(request: Request, path: str = "") -> Response:
     }
     upstream_path = f"/{path}" if path else "/"
     try:
-        upstream = requests.request(
+        upstream = await asyncio.to_thread(
+            requests.request,
             method=request.method,
             url=f"{MINISTACK_ENDPOINT}{upstream_path}",
             params=request.query_params,
             headers=headers,
             data=body,
-            timeout=30,
+            timeout=(3, 10),
         )
     except requests.RequestException as exc:
         log.error("Falha ao encaminhar chamada DynamoDB: %s", exc)
@@ -326,11 +329,16 @@ def _stop_health_monitor() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _warmup_task
     log.info("chaos-bridge iniciando. MiniStack endpoint: %s", MINISTACK_ENDPOINT)
     log.info("Container alvo: %s", MINISTACK_CONTAINER_NAME)
     _start_health_monitor()
+    _warmup_task = asyncio.create_task(_warm_product_apis())
     yield
     log.info("chaos-bridge encerrando.")
+    if _warmup_task:
+        _warmup_task.cancel()
+        await asyncio.gather(_warmup_task, return_exceptions=True)
     _stop_health_monitor()
     for name in list(_paused_containers):
         _unpause_container(name)
@@ -381,6 +389,61 @@ def _api_id_for_region(region: str) -> str | None:
         if api.get("tags", {}).get("_custom_id_") in {"12345", "67890"}:
             return api.get("id")
     return None
+
+
+async def _warm_product_apis() -> None:
+    """Aquece os runtimes Java fora do hook de provisionamento."""
+    for _ in range(30):
+        try:
+            api_ids = {
+                region: await asyncio.to_thread(_api_id_for_region, region)
+                for region in FAILOVER_REGIONS
+            }
+        except Exception:
+            api_ids = {}
+
+        if all(api_ids.get(region) for region in FAILOVER_REGIONS):
+            break
+        await asyncio.sleep(2)
+    else:
+        log.warning("Warm-up ignorado: APIs regionais ainda não estão disponíveis.")
+        return
+
+    for region in FAILOVER_REGIONS:
+        api_id = api_ids[region]
+        for method, kwargs in (
+            ("get", {"params": {"id": "__warmup__"}}),
+            ("post", {"json": {
+                "id": "__warmup_add__",
+                "name": "Warmup",
+                "price": "0",
+                "description": "runtime warmup",
+            }}),
+        ):
+            for attempt in range(1, 4):
+                try:
+                    response = await asyncio.to_thread(
+                        getattr(requests, method),
+                        _product_api_url(region, api_id),
+                        timeout=(3, WARMUP_TIMEOUT),
+                        **kwargs,
+                    )
+                    log.info(
+                        "Warm-up %s %s concluído com HTTP %s.",
+                        method,
+                        region,
+                        response.status_code,
+                    )
+                    break
+                except requests.RequestException as exc:
+                    log.warning(
+                        "Warm-up %s %s falhou (tentativa %s/3): %s",
+                        method,
+                        region,
+                        attempt,
+                        exc,
+                    )
+                    await asyncio.sleep(5)
 
 
 def _ordered_failover_regions(preferred_region: str | None) -> list[str]:
@@ -492,11 +555,12 @@ async def _invoke_product_api(
 async def console_resources() -> dict[str, Any]:
     """Retorna um resumo dos recursos provisionados para a console."""
     result: dict[str, Any] = {"regions": {}, "route53": {}, "faults": []}
-    for region in ("us-east-1", "us-west-1"):
+
+    def load_region(region: str) -> tuple[str, dict[str, Any]]:
         apis = _console_client("apigateway", region).get_rest_apis().get("items", [])
         tables = _console_client("dynamodb", region).list_tables().get("TableNames", [])
         functions = _console_client("lambda", region).list_functions().get("Functions", [])
-        result["regions"][region] = {
+        return region, {
             "apis": [
                 {"id": api["id"], "name": api.get("name"), "tags": api.get("tags", {})}
                 for api in apis
@@ -505,11 +569,19 @@ async def console_resources() -> dict[str, Any]:
             "functions": [fn["FunctionName"] for fn in functions],
         }
 
-    route53 = _console_client("route53")
-    result["route53"] = {
-        "hosted_zones": route53.list_hosted_zones().get("HostedZones", []),
-        "health_checks": route53.list_health_checks().get("HealthChecks", []),
-    }
+    region_results = await asyncio.gather(
+        *(asyncio.to_thread(load_region, region) for region in FAILOVER_REGIONS)
+    )
+    for region, region_data in region_results:
+        result["regions"][region] = region_data
+
+    route53_data = await asyncio.to_thread(
+        lambda: {
+            "hosted_zones": _console_client("route53").list_hosted_zones().get("HostedZones", []),
+            "health_checks": _console_client("route53").list_health_checks().get("HealthChecks", []),
+        }
+    )
+    result["route53"] = route53_data
     with _faults_lock:
         result["faults"] = list(_active_faults)
     return result

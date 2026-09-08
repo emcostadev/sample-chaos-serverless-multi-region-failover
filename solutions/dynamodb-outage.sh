@@ -18,11 +18,17 @@ error_log() { echo -e "${RED}[$(date +'%Y-%m-%d %H:%M:%S')] ERROR:${NC} $1" >&2;
 trap 'error_log "An error occurred. Exiting..."; exit 1' ERR
 
 log "Creating SNS topic 'ProductEventsTopic'..."
-SNS_TOPIC_ARN=$($AWS_CLI sns create-topic --name ProductEventsTopic --output json | jq -r '.TopicArn')
+SNS_TOPIC_ARN=$($AWS_CLI sns create-topic \
+    --name ProductEventsTopic \
+    --query 'TopicArn' \
+    --output text)
 log "SNS topic created. ARN: $SNS_TOPIC_ARN"
 
 log "Creating SQS queue 'ProductEventsQueue'..."
-QUEUE_URL=$($AWS_CLI sqs create-queue --queue-name ProductEventsQueue --output json | jq -r '.QueueUrl')
+QUEUE_URL=$($AWS_CLI sqs create-queue \
+    --queue-name ProductEventsQueue \
+    --query 'QueueUrl' \
+    --output text)
 QUEUE_ARN=$($AWS_CLI sqs get-queue-attributes \
     --queue-url $QUEUE_URL \
     --attribute-names QueueArn \

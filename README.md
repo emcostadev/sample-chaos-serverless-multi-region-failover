@@ -353,7 +353,7 @@ Quando a região preferida tiver fault de `apigateway` ou `lambda`, ela será
 ignorada e a chamada seguirá para a próxima região. A resposta inclui os
 headers `X-Failover-Region` e `X-Failover-Api-Id`. Se as duas regiões estiverem
 indisponíveis, o endpoint retorna `503`. Cada região recebe até duas tentativas,
-com timeout de conexão de 3 segundos e leitura de 15 segundos, para tolerar
+com timeout de conexão de 3 segundos e leitura de 8 segundos, para evitar
 falhas transitórias de cold start sem bloquear indefinidamente o failover.
 
 ---
@@ -363,6 +363,21 @@ falhas transitórias de cold start sem bloquear indefinidamente o failover.
 ```bash
 make test
 ```
+
+### Destruir e limpar o ambiente
+
+Quando for necessário recriar o laboratório do zero, use o alvo destrutivo
+abaixo. Ele remove os containers do Compose, containers temporários das
+Lambdas, volumes associados e o estado persistido do MiniStack em `./volume`,
+incluindo os recursos provisionados:
+
+```bash
+make destroy CONFIRM=destroy
+```
+
+O parâmetro `CONFIRM=destroy` é obrigatório para evitar uma remoção acidental.
+Esse comando não remove imagens Docker, os artefatos compilados das Lambdas
+nem arquivos do repositório fora de `./volume`.
 
 Variáveis de ambiente usadas pelos testes:
 
@@ -391,7 +406,7 @@ Variáveis de ambiente usadas pelos testes:
 | `chaos-bridge` não inicia | Verifique se `/var/run/docker.sock` está montado e o usuário tem permissão |
 | Proxy DynamoDB não responde | `curl http://localhost:4567/_chaos_bridge/health` para diagnóstico e verifique `AWS_DYNAMODB_ENDPOINT=http://chaos-bridge:4567/dynamodb` |
 | Lambda não conecta ao DynamoDB | Verifique `AWS_ENDPOINT_HOST=ministack` e `AWS_DYNAMODB_ENDPOINT` no `init-resources.sh` |
-| `init-resources.sh` falha com `jq not found` | O script instala `jq` via `apk` — precisa de acesso à internet no container |
+| `init-resources.sh` falha durante o startup | O hook não depende mais de `jq` nem de acesso externo para fazer parsing; verifique os logs com `docker compose logs ministack` e confirme que os artefatos Java foram compilados com `make install` |
 | Testes de failover falham | O MiniStack não executa health checks reais. O `test_failover.py` usa verificação via SDK (não dig/DNS). Confirme que o chaos-bridge está rodando. |
 
 ---

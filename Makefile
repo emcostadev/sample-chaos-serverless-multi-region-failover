@@ -42,6 +42,24 @@ start:			## Sobe MiniStack + chaos-bridge
 stop:			## Para todos os containers
 	docker compose down
 
+destroy:		## Destrói containers, volumes e o estado local (requer CONFIRM=destroy)
+	@test "$(CONFIRM)" = "destroy" || { \
+		echo "Operação destrutiva bloqueada."; \
+		echo "Para confirmar, execute: make destroy CONFIRM=destroy"; \
+		exit 1; \
+	}
+	docker compose down --volumes --remove-orphans
+	@LAMBDA_CONTAINERS="$$(docker ps -aq --filter label=ministack=lambda)"; \
+	if [ -n "$$LAMBDA_CONTAINERS" ]; then \
+		echo "Removendo containers temporários das Lambdas"; \
+		docker rm -f $$LAMBDA_CONTAINERS; \
+	fi
+	@test ! -e ./volume || { \
+		echo "Removendo o estado persistido em ./volume"; \
+		rm -rf ./volume; \
+	}
+	@echo "Ambiente local destruído e estado persistido removido."
+
 logs:			## Salva logs em logs.txt
 	docker compose logs > logs.txt
 
@@ -73,4 +91,4 @@ chaos-clear:		## Remove todos os faults ativos
 		-H 'Content-Type: application/json' \
 		-d '[]' | python3 -m json.tool
 
-.PHONY: usage check install start ready deploy test logs stop chaos-status chaos-inject chaos-clear
+.PHONY: usage check install start ready deploy test logs stop destroy chaos-status chaos-inject chaos-clear

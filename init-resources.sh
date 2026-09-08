@@ -5,8 +5,6 @@
 
 set -e
 
-apk add --no-cache jq
-
 AWS_CLI="aws --endpoint-url ${AWS_ENDPOINT_URL:-http://localhost:4566}"
 
 # ---------------------------------------------------
@@ -38,7 +36,11 @@ $AWS_CLI lambda create-function \
   --environment 'Variables={AWS_REGION=us-east-1,AWS_ENDPOINT_HOST=ministack,AWS_DYNAMODB_ENDPOINT=http://chaos-bridge:4567/dynamodb}' \
   --region us-east-1
 
-export STREAM_ARN=$($AWS_CLI dynamodb describe-table --table-name Products --region us-east-1 | jq -r '.Table.LatestStreamArn')
+export STREAM_ARN=$($AWS_CLI dynamodb describe-table \
+  --table-name Products \
+  --region us-east-1 \
+  --query 'Table.LatestStreamArn' \
+  --output text)
 $AWS_CLI lambda create-event-source-mapping \
   --function-name dynamodb-streams-to-lambda \
   --event-source-arn $STREAM_ARN \
@@ -82,11 +84,29 @@ $AWS_CLI lambda create-function \
 export REST_API_ID=$($AWS_CLI apigateway create-rest-api \
   --name quote-api-gateway \
   --tags '{"_custom_id_":"12345"}' \
-  --region us-east-1 | jq -r '.id')
+  --region us-east-1 \
+  --query 'id' \
+  --output text)
 
-export PARENT_ID=$($AWS_CLI apigateway get-resources --rest-api-id $REST_API_ID --region=us-east-1 | jq -r '.items[0].id')
-export RESOURCE_ID=$($AWS_CLI apigateway create-resource --rest-api-id $REST_API_ID --parent-id $PARENT_ID --path-part "productApi" --region=us-east-1 | jq -r '.id')
-export HEALTHCHECK_RESOURCE_ID=$($AWS_CLI apigateway create-resource --rest-api-id $REST_API_ID --parent-id $PARENT_ID --path-part "healthcheck" --region=us-east-1 | jq -r '.id')
+export PARENT_ID=$($AWS_CLI apigateway get-resources \
+  --rest-api-id "$REST_API_ID" \
+  --region=us-east-1 \
+  --query 'items[0].id' \
+  --output text)
+export RESOURCE_ID=$($AWS_CLI apigateway create-resource \
+  --rest-api-id "$REST_API_ID" \
+  --parent-id "$PARENT_ID" \
+  --path-part "productApi" \
+  --region=us-east-1 \
+  --query 'id' \
+  --output text)
+export HEALTHCHECK_RESOURCE_ID=$($AWS_CLI apigateway create-resource \
+  --rest-api-id "$REST_API_ID" \
+  --parent-id "$PARENT_ID" \
+  --path-part "healthcheck" \
+  --region=us-east-1 \
+  --query 'id' \
+  --output text)
 
 $AWS_CLI apigateway put-method --rest-api-id $REST_API_ID --resource-id $RESOURCE_ID --http-method GET \
   --request-parameters "method.request.path.productApi=true" --authorization-type "NONE" --region=us-east-1
@@ -163,11 +183,29 @@ $AWS_CLI lambda create-function \
 export REST_API_ID=$($AWS_CLI apigateway create-rest-api \
   --name quote-api-gateway \
   --tags '{"_custom_id_":"67890"}' \
-  --region us-west-1 | jq -r '.id')
+  --region us-west-1 \
+  --query 'id' \
+  --output text)
 
-export PARENT_ID=$($AWS_CLI apigateway get-resources --rest-api-id $REST_API_ID --region=us-west-1 | jq -r '.items[0].id')
-export RESOURCE_ID=$($AWS_CLI apigateway create-resource --rest-api-id $REST_API_ID --parent-id $PARENT_ID --path-part "productApi" --region=us-west-1 | jq -r '.id')
-export HEALTHCHECK_RESOURCE_ID=$($AWS_CLI apigateway create-resource --rest-api-id $REST_API_ID --parent-id $PARENT_ID --path-part "healthcheck" --region=us-west-1 | jq -r '.id')
+export PARENT_ID=$($AWS_CLI apigateway get-resources \
+  --rest-api-id "$REST_API_ID" \
+  --region=us-west-1 \
+  --query 'items[0].id' \
+  --output text)
+export RESOURCE_ID=$($AWS_CLI apigateway create-resource \
+  --rest-api-id "$REST_API_ID" \
+  --parent-id "$PARENT_ID" \
+  --path-part "productApi" \
+  --region=us-west-1 \
+  --query 'id' \
+  --output text)
+export HEALTHCHECK_RESOURCE_ID=$($AWS_CLI apigateway create-resource \
+  --rest-api-id "$REST_API_ID" \
+  --parent-id "$PARENT_ID" \
+  --path-part "healthcheck" \
+  --region=us-west-1 \
+  --query 'id' \
+  --output text)
 
 $AWS_CLI apigateway put-method --rest-api-id $REST_API_ID --resource-id $RESOURCE_ID --http-method GET \
   --request-parameters "method.request.path.productApi=true" --authorization-type "NONE" --region=us-west-1
