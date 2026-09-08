@@ -82,6 +82,8 @@ _paused_containers: set[str] = set()  # containers atualmente pausados por este 
 _health_check_thread: threading.Thread | None = None
 _health_check_stop = threading.Event()
 _warmup_task: asyncio.Task | None = None
+_runtime_cleanup_task: asyncio.Task | None = None
+_failover_lock = asyncio.Lock()
 
 # ---------------------------------------------------------------------------
 # Docker client
@@ -98,6 +100,33 @@ def get_docker_client() -> docker.DockerClient:
         raise RuntimeError(
             "Docker socket não disponível. Monte /var/run/docker.sock no container chaos-bridge."
         ) from exc
+
+
+def _cleanup_stale_lambda_containers() -> None:
+    """Remove somente runtimes Lambda que ficaram em Created após spawn abortado."""
+    try:
+        client = get_docker_client()
+        stale = client.containers.list(
+            all=True,
+            filters={"label": "ministack=lambda", "status": "created"},
+        )
+        for container in stale:
+            log.warning("Removendo runtime Lambda órfão em Created: %s", container.name)
+            try:
+                container.reload()
+                if container.status != "created":
+                    continue
+                container.remove()
+            except (docker.errors.NotFound, docker.errors.APIError):
+                continue
+    except Exception as exc:
+        log.warning("Não foi possível limpar runtimes Lambda órfãos: %s", exc)
+
+
+async def _lambda_runtime_cleanup() -> None:
+    while True:
+        await asyncio.sleep(30)
+        await asyncio.to_thread(_cleanup_stale_lambda_containers)
 
 
 # ---------------------------------------------------------------------------
@@ -329,16 +358,20 @@ def _stop_health_monitor() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _warmup_task
+    global _warmup_task, _runtime_cleanup_task
     log.info("chaos-bridge iniciando. MiniStack endpoint: %s", MINISTACK_ENDPOINT)
     log.info("Container alvo: %s", MINISTACK_CONTAINER_NAME)
     _start_health_monitor()
     _warmup_task = asyncio.create_task(_warm_product_apis())
+    _runtime_cleanup_task = asyncio.create_task(_lambda_runtime_cleanup())
     yield
     log.info("chaos-bridge encerrando.")
     if _warmup_task:
         _warmup_task.cancel()
         await asyncio.gather(_warmup_task, return_exceptions=True)
+    if _runtime_cleanup_task:
+        _runtime_cleanup_task.cancel()
+        await asyncio.gather(_runtime_cleanup_task, return_exceptions=True)
     _stop_health_monitor()
     for name in list(_paused_containers):
         _unpause_container(name)
@@ -457,7 +490,7 @@ def _product_api_url(region: str, api_id: str) -> str:
     return f"{MINISTACK_ENDPOINT}/restapis/{api_id}/dev/_user_request_/productApi"
 
 
-async def _invoke_product_api(
+async def _invoke_product_api_unlocked(
     body: dict[str, Any],
     *,
     method: str,
@@ -549,6 +582,21 @@ async def _invoke_product_api(
             "skipped_regions": skipped_regions,
         },
     )
+
+
+async def _invoke_product_api(
+    body: dict[str, Any],
+    *,
+    method: str,
+    preferred_region: str | None = None,
+) -> Response:
+    """Serializa invocações para evitar cold starts concorrentes no executor Docker."""
+    async with _failover_lock:
+        return await _invoke_product_api_unlocked(
+            body,
+            method=method,
+            preferred_region=preferred_region,
+        )
 
 
 @app.get("/console/api/resources")
