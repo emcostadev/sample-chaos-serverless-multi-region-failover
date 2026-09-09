@@ -71,11 +71,17 @@ ready:			## Aguarda MiniStack e chaos-bridge estarem prontos
 	done
 	@echo "MiniStack pronto!"
 	@echo "Aguardando chaos-bridge ficar pronto..."
-	@while [[ "$$(curl -s http://localhost:4567/_chaos_bridge/health | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("status","nok"))' 2>/dev/null)" != "ok" ]]; do \
+	@while true; do \
+		BRIDGE_STATUS="$$(curl -s http://localhost:4567/_chaos_bridge/health | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("warmup_status", "nok"))' 2>/dev/null)"; \
+		if [ "$$BRIDGE_STATUS" = "ready" ]; then break; fi; \
+		if [ "$$BRIDGE_STATUS" = "failed" ]; then \
+			curl -s http://localhost:4567/_chaos_bridge/health | python3 -c 'import sys,json; print(json.load(sys.stdin).get("warmup_error", "warm-up falhou"))'; \
+			exit 1; \
+		fi; \
 		echo "chaos-bridge não está pronto, aguardando..."; \
 		sleep 3; \
 	done
-	@echo "chaos-bridge pronto!"
+	@echo "chaos-bridge pronto e Lambdas GET/POST aquecidas!"
 
 chaos-status:		## Exibe faults de chaos ativos
 	@echo "Faults ativos:"

@@ -88,6 +88,8 @@ _health_check_stop = threading.Event()
 _warmup_task: asyncio.Task | None = None
 _runtime_cleanup_task: asyncio.Task | None = None
 _failover_lock = asyncio.Lock()
+_warmup_status = "warming"
+_warmup_error: str | None = None
 
 # ---------------------------------------------------------------------------
 # Docker client
@@ -383,9 +385,11 @@ def _stop_health_monitor() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _warmup_task, _runtime_cleanup_task
+    global _warmup_task, _runtime_cleanup_task, _warmup_status, _warmup_error
     log.info("chaos-bridge iniciando. MiniStack endpoint: %s", MINISTACK_ENDPOINT)
     log.info("Container alvo: %s", MINISTACK_CONTAINER_NAME)
+    _warmup_status = "warming"
+    _warmup_error = None
     _start_health_monitor()
     _warmup_task = asyncio.create_task(_warm_product_apis())
     _runtime_cleanup_task = asyncio.create_task(_lambda_runtime_cleanup())
@@ -451,6 +455,7 @@ def _api_id_for_region(region: str) -> str | None:
 
 async def _warm_product_apis() -> None:
     """Aquece os runtimes Java fora do hook de provisionamento."""
+    global _warmup_status, _warmup_error
     for _ in range(30):
         try:
             api_ids = {
@@ -464,9 +469,12 @@ async def _warm_product_apis() -> None:
             break
         await asyncio.sleep(2)
     else:
-        log.warning("Warm-up ignorado: APIs regionais ainda não estão disponíveis.")
+        _warmup_status = "failed"
+        _warmup_error = "APIs regionais não ficaram disponíveis a tempo para o warm-up."
+        log.warning("Warm-up ignorado: %s", _warmup_error)
         return
 
+    failures: list[str] = []
     for region in FAILOVER_REGIONS:
         api_id = api_ids[region]
         for method, kwargs in (
@@ -486,13 +494,17 @@ async def _warm_product_apis() -> None:
                         timeout=(3, WARMUP_TIMEOUT),
                         **kwargs,
                     )
-                    log.info(
-                        "Warm-up %s %s concluído com HTTP %s.",
-                        method,
-                        region,
-                        response.status_code,
+                    if response.status_code < 500:
+                        log.info(
+                            "Warm-up %s %s concluído com HTTP %s.",
+                            method,
+                            region,
+                            response.status_code,
+                        )
+                        break
+                    raise requests.RequestException(
+                        f"HTTP {response.status_code} durante o warm-up"
                     )
-                    break
                 except requests.RequestException as exc:
                     log.warning(
                         "Warm-up %s %s falhou (tentativa %s/3): %s",
@@ -502,6 +514,17 @@ async def _warm_product_apis() -> None:
                         exc,
                     )
                     await asyncio.sleep(5)
+            else:
+                failures.append(f"{method.upper()} {region}")
+
+    if failures:
+        _warmup_status = "failed"
+        _warmup_error = "Falha ao aquecer: " + ", ".join(failures)
+        log.error(_warmup_error)
+        return
+
+    _warmup_status = "ready"
+    log.info("Warm-up das APIs de produto concluído.")
 
 
 def _ordered_failover_regions(preferred_region: str | None) -> list[str]:
@@ -860,6 +883,8 @@ async def health() -> dict:
 
     return {
         "status": "ok",
+        "warmup_status": _warmup_status,
+        "warmup_error": _warmup_error,
         "ministack_reachable": ministack_ok,
         "docker_reachable": docker_ok,
         "active_faults": faults,
