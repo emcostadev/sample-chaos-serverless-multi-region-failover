@@ -27,18 +27,18 @@ public class DynamoDBWriterLambda extends ProductApi implements RequestHandler<S
         JsonNode rootNode = objectMapper.readTree(msg.getBody());
         String messageContent = rootNode.get("Message").asText();
 
-        Map<String, String> productData;
+        Map<String, Object> productData;
         try {
           productData = objectMapper.readValue(messageContent, HashMap.class);
         } catch (JsonProcessingException e) {
           throw new RuntimeException(e);
         }
         HashMap<String, AttributeValue> itemValues = new HashMap<>();
-        itemValues.put("id", AttributeValue.builder().s(productData.get("id")).build());
-        itemValues.put("name", AttributeValue.builder().s(productData.get("name")).build());
-        itemValues.put("price", AttributeValue.builder().n(productData.get("price")).build());
+        itemValues.put("id", AttributeValue.builder().s(String.valueOf(productData.get("id"))).build());
+        itemValues.put("name", AttributeValue.builder().s(String.valueOf(productData.get("name"))).build());
+        itemValues.put("price", AttributeValue.builder().n(String.valueOf(productData.get("price"))).build());
         itemValues.put("description",
-            AttributeValue.builder().s(productData.get("description")).build());
+            AttributeValue.builder().s(String.valueOf(productData.get("description"))).build());
 
         // Put the item into the DynamoDB table
         PutItemRequest putItemRequest = PutItemRequest.builder()

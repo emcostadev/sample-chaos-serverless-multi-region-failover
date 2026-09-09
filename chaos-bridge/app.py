@@ -43,6 +43,7 @@ import re
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,9 @@ FAILOVER_CONNECT_TIMEOUT = float(os.environ.get("FAILOVER_CONNECT_TIMEOUT", "3")
 FAILOVER_READ_TIMEOUT = float(os.environ.get("FAILOVER_READ_TIMEOUT", "8"))
 FAILOVER_ATTEMPTS_PER_REGION = int(os.environ.get("FAILOVER_ATTEMPTS_PER_REGION", "1"))
 WARMUP_TIMEOUT = float(os.environ.get("WARMUP_TIMEOUT", "120"))
+LAMBDA_CONTAINER_STALE_AFTER_SECONDS = int(
+    os.environ.get("LAMBDA_CONTAINER_STALE_AFTER_SECONDS", "120")
+)
 RETRYABLE_UPSTREAM_STATUS_CODES = {502, 503, 504}
 
 # ---------------------------------------------------------------------------
@@ -103,7 +107,13 @@ def get_docker_client() -> docker.DockerClient:
 
 
 def _cleanup_stale_lambda_containers() -> None:
-    """Remove somente runtimes Lambda que ficaram em Created após spawn abortado."""
+    """Remove runtimes Lambda em Created somente depois do período de tolerância.
+
+    Durante um cold start, o MiniStack cria o container e depois copia o
+    código para /var/task. Removê-lo imediatamente enquanto ainda está em
+    Created interrompe esse fluxo e faz a invocação falhar com "No such
+    container".
+    """
     try:
         client = get_docker_client()
         stale = client.containers.list(
@@ -111,13 +121,28 @@ def _cleanup_stale_lambda_containers() -> None:
             filters={"label": "ministack=lambda", "status": "created"},
         )
         for container in stale:
-            log.warning("Removendo runtime Lambda órfão em Created: %s", container.name)
             try:
                 container.reload()
                 if container.status != "created":
                     continue
+                created_at = datetime.fromisoformat(
+                    container.attrs["Created"].replace("Z", "+00:00")
+                )
+                age_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
+                if age_seconds < LAMBDA_CONTAINER_STALE_AFTER_SECONDS:
+                    log.debug(
+                        "Preservando runtime Lambda em cold start: %s (%.1fs)",
+                        container.name,
+                        age_seconds,
+                    )
+                    continue
+                log.warning(
+                    "Removendo runtime Lambda órfão em Created: %s (%.1fs)",
+                    container.name,
+                    age_seconds,
+                )
                 container.remove()
-            except (docker.errors.NotFound, docker.errors.APIError):
+            except (KeyError, ValueError, docker.errors.NotFound, docker.errors.APIError):
                 continue
     except Exception as exc:
         log.warning("Não foi possível limpar runtimes Lambda órfãos: %s", exc)
